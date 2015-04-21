@@ -39,9 +39,8 @@ var fsevents        = require('fsevents'),
 
 
 // Merge default configuration options with config.json if present
-if (fs.existsSync(config.localDir + '/config.json')) {
-    config = extend(config, JSON.parse(fs.readFileSync(config.localDir + '/config.json')));
-    DEBUG = !!config.debug;
+if (fs.existsSync(process.cwd() + '/config.json')) {
+    config = extend(config, require(process.cwd() + '/config.json'));
 }
 
 // Build regular expressions from globs
@@ -77,9 +76,8 @@ function shouldIgnore(event, path) {
     return false;
 }
 
-var watcher = fsevents(config.localDir);
-
-var watcherLogStream;
+var watcher = fsevents(config.localDir),
+    watcherLogStream;
 
 if (config.watcherLog) {
     watcherLogStream = fs.createWriteStream(config.watcherLog, {flags: 'a'});
