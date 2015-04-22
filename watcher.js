@@ -2,13 +2,17 @@
 
 var fsevents        = require('fsevents'),
     fs              = require('fs'),
-    extend          = require('util')._extend,
     http            = require('http'),
     Agent           = require('agentkeepalive'),
     getRelativePath = require('path').relative,
     RelPathList     = require('pathspec').RelPathList,
     async           = require('async'),
     colors          = require('colors/safe'),
+    crypto          = require('crypto'),
+    notifier        = require('node-notifier'),
+    exec            = require('child_process').exec,
+    vfsChecksums   = {},
+    ignoreChecksums = {},
 
     config          = {
         debug:      false,
@@ -23,7 +27,7 @@ var fsevents        = require('fsevents'),
             global: [],
             watch:  [],
             sync:   [],
-            git:    [],
+            git:    []
         },
 
         sound: {
@@ -35,19 +39,88 @@ var fsevents        = require('fsevents'),
     ignoreList      = {},
     movedOut        = null,
     DEBUG           = false,
-    drainSound = null;
+    drainSound      = null;
 
+function extend(dest, from) {
+    // http://stackoverflow.com/a/13418957/1337301
+    var props = Object.getOwnPropertyNames(from),
+        destination;
+
+    props.forEach(function (name) {
+        if (typeof from[name] === 'object') {
+            if (typeof dest[name] !== 'object') {
+                dest[name] = {};
+            }
+            extend(dest[name],from[name]);
+        } else {
+            destination = Object.getOwnPropertyDescriptor(from, name);
+            Object.defineProperty(dest, name, destination);
+        }
+    });
+}
 
 // Merge default configuration options with config.json if present
-if (fs.existsSync(config.localDir + '/config.json')) {
-    config = extend(config, JSON.parse(fs.readFileSync(config.localDir + '/config.json')));
-    DEBUG = !!config.debug;
+if (fs.existsSync(process.cwd() + '/config.json')) {
+    extend(config, require(process.cwd() + '/config.json'));
 }
 
 // Build regular expressions from globs
 for (var ignoreType in config.ignore) {
     ignoreList[ignoreType] = RelPathList.parse(config.ignore[ignoreType]);
 }
+
+function cacheCurrentChecksums() {
+    // TODO: This could probably be done in node where it would obey the ignore patterns
+    exec("find . -not -path '*/.git/*' -not -iname '.*' -type f -print | xargs sha1sum | sed 's/\\.\\///'",
+        { maxBuffer: 1e+6 },
+        function(error, stdout, stderr) {
+            if (error) {
+                console.log(colors.yellow('[FAILED] ') + 'Failed to cache current checksums. Git may be wonky!');
+            }
+
+            stdout.split('\n').forEach(function(line) {
+                if (line == '') {
+                    return;
+                }
+
+                ignoreChecksums[line.substr(42)] = line.substr(0, 40);
+            });
+    });
+}
+
+function cacheVFSChecksums() {
+    var vfsFile;
+
+    try {
+        vfsFile = fs.readFileSync(config.localDir + '/.vfs_checksums', { encoding: 'utf8' }).split('\n');
+
+        vfsFile.forEach(function(line) {
+            if (line == '') {
+                return;
+            }
+
+            vfsChecksums[line.substr(42)] = line.substr(0, 40);
+        });
+    } catch (e) {
+        console.error(e);
+    }
+
+    if (Object.keys(ignoreChecksums).length === 0) {
+        ignoreChecksums = JSON.parse(JSON.stringify(vfsChecksums));
+    }
+
+    return vfsChecksums;
+}
+
+// Cache the VFS checksums if available
+cacheVFSChecksums();
+
+// Cache the checksums of all files in the config.localDir
+cacheCurrentChecksums();
+
+// Update the .gitignore file
+updateGitIgnore();
+
 
 function playSound(sound) {
     sound = sound || config.sound.success;
@@ -77,9 +150,8 @@ function shouldIgnore(event, path) {
     return false;
 }
 
-var watcher = fsevents(config.localDir);
-
-var watcherLogStream;
+var watcher = fsevents(config.localDir),
+    watcherLogStream;
 
 if (config.watcherLog) {
     watcherLogStream = fs.createWriteStream(config.watcherLog, {flags: 'a'});
@@ -104,6 +176,44 @@ q.drain = function() {
         playSound(drainSound);
     }
 };
+
+function sha1sum(path, cb) {
+    var shasum = crypto.createHash('sha1'),
+        stream = fs.ReadStream(path);
+
+    stream.on('data', function(d) {
+        shasum.update(d);
+    });
+
+    stream.on('end', function() {
+        cb(null, shasum.digest('hex'));
+    });
+
+    stream.on('error', function(err) {
+        cb(err, null);
+    })
+}
+
+function updateGitIgnore() {
+    // TODO: Make it so this doesn't do a write if the file is unchanged
+
+    var ignore = [],
+        gitignore;
+
+    for(var file in ignoreChecksums) {
+        if (vfsChecksums[file] === ignoreChecksums[file]) {
+            ignore.push(file);
+        }
+    }
+
+    gitignore = config.ignore.global.concat(config.ignore.git.concat(ignore));
+
+    try {
+        fs.writeFileSync(config.localDir + '/.gitignore', gitignore.join('\n'));
+    } catch (e) {
+        console.log(colors.yellow('[FAILED] ') + 'Failed to update .gitignore (' + e + ')');
+    }
+}
 
 function webDavRequest(verb, destination, file, callback) {
     var fileStream,
@@ -130,7 +240,7 @@ function webDavRequest(verb, destination, file, callback) {
         auth:    config.webdav.username + ':' + config.webdav.password
     });
 
-    request.on("response", function (res) {
+    request.on('response', function (res) {
         // Ignore when a delete fails due to a 404
         if (res.statusCode >= 400 && !(verb === 'DELETE' && res.statusCode == 404) && // delete a file that doesn't exist
             !(verb === 'MKCOL' && res.statusCode == 405)  // make a directory that already exists
@@ -150,6 +260,21 @@ function webDavRequest(verb, destination, file, callback) {
     if (fileStream) {
         fileStream.pipe(request);
     } else {
+        if (verb === 'PUT') {
+            sha1sum(file, function(err, sha1) {
+                var origChecksum = vfsChecksums[file].toString();
+
+                if (!err) {
+                    vfsChecksums[file] = sha1;
+
+                    if (origChecksum === sha1) {
+                        console.log("CHECKSUM DID NOT CHANGE!");
+                    } else{
+                        console.log("CHECKSUM CHANGED!");
+                    }
+                }
+            });
+        }
         request.end();
     }
 }
@@ -186,6 +311,15 @@ watcher.on('change', function (path, info) {
             }
             info.event = 'created';
         }
+    } else if (relPath !== '.gitignore') {
+
+        sha1sum(path, function(err, checksum) {
+            if (!err) {
+                DEBUG || console.log(path + ': ' + checksum);
+                ignoreChecksums[path] = checksum;
+                updateGitIgnore();
+            }
+        });
     }
 
     dst = relPath;
@@ -193,6 +327,10 @@ watcher.on('change', function (path, info) {
 
     switch (info.event) {
         case 'modified':
+            if(relPath === '.vfs_checksums') {
+                DEBUG || console.log("Refreshing VFS checksum cache from local FS");
+                cacheVFSChecksums();
+            }
         case 'created':
             verb = isDir ? 'MKCOL' : 'PUT';
             src = path;
@@ -252,3 +390,15 @@ watcher.on('change', function (path, info) {
 });
 
 watcher.start();
+
+// TODO: This is an anti-pattern, but ok for what we're using it for
+process.on('uncaughtException', function(err) {
+    console.error(err);
+
+    require('child_process').exec("say -v Boing \"I'm sorry Dave, I'm afraid I can't do that\"");
+
+    notifier.notify({
+        'title': 'Emergence-watcher',
+        'message': err
+    });
+});
