@@ -91,9 +91,8 @@ function cacheCurrentChecksums() {
 function cacheVFSChecksums() {
     var vfsFile;
 
-    // TODO: config.localDir can't have a value of "./" here
     try {
-        vfsFile = fs.readFileSync('/Users/jmealo/slate/spark2/' + "/.vfs_checksums", { encoding: 'utf8' }).split("\n");
+        vfsFile = fs.readFileSync(config.localDir + '/.vfs_checksums', { encoding: 'utf8' }).split('\n');
 
         vfsFile.forEach(function(line) {
             if (line == '') {
