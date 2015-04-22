@@ -83,9 +83,18 @@ function outputTarball($exportDir) {
 set_time_limit(0);
 
 $exportDir = isset($_GET['dir']) ? $_GET['dir'] : ('/tmp/' . \Site::$title);
+$outputTar = isset($_GET['tar']) ? $_GET['tar'] == '0' : false;
 
 basicAuth();
 retrieveRemoteFiles();
 exportTree($exportDir);
 generateChecksumFile($exportDir, '.vfs_checksums');
-outputTarball($exportDir);
+$checksumFile = file_get_contents($exportDir . "/.vfs_checksums");
+
+if ($outputTar) {
+    header("Content-type: application/octet-stream");
+    header("Content-disposition: attachment;filename=.vfs_checksums");
+    print $checksumFile;
+} else {
+    outputTarball($exportDir);
+}

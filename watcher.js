@@ -2,7 +2,6 @@
 
 var fsevents        = require('fsevents'),
     fs              = require('fs'),
-    extend          = require('util')._extend,
     http            = require('http'),
     Agent           = require('agentkeepalive'),
     getRelativePath = require('path').relative,
@@ -11,6 +10,7 @@ var fsevents        = require('fsevents'),
     colors          = require('colors/safe'),
     crypto          = require('crypto'),
     notifier        = require('node-notifier'),
+    exec            = require('child_process').exec,
     vfsChecksums   = {},
     ignoreChecksums = {},
 
@@ -41,14 +41,51 @@ var fsevents        = require('fsevents'),
     DEBUG           = false,
     drainSound      = null;
 
+function extend(dest, from) {
+    // http://stackoverflow.com/a/13418957/1337301
+    var props = Object.getOwnPropertyNames(from),
+        destination;
+
+    props.forEach(function (name) {
+        if (typeof from[name] === 'object') {
+            if (typeof dest[name] !== 'object') {
+                dest[name] = {};
+            }
+            extend(dest[name],from[name]);
+        } else {
+            destination = Object.getOwnPropertyDescriptor(from, name);
+            Object.defineProperty(dest, name, destination);
+        }
+    });
+}
+
 // Merge default configuration options with config.json if present
 if (fs.existsSync(process.cwd() + '/config.json')) {
-    config = extend(config, require(process.cwd() + '/config.json'));
+    extend(config, require(process.cwd() + '/config.json'));
 }
 
 // Build regular expressions from globs
 for (var ignoreType in config.ignore) {
     ignoreList[ignoreType] = RelPathList.parse(config.ignore[ignoreType]);
+}
+
+function cacheCurrentChecksums() {
+    // TODO: This could probably be done in node where it would obey the ignore patterns
+    exec("find . -not -path '*/.git/*' -not -iname '.*' -type f -print | xargs sha1sum | sed 's/\\.\\///'",
+        { maxBuffer: 1e+6 },
+        function(error, stdout, stderr) {
+            if (error) {
+                console.log(colors.yellow('[FAILED] ') + 'Failed to cache current checksums. Git may be wonky!');
+            }
+
+            stdout.split('\n').forEach(function(line) {
+                if (line == '') {
+                    return;
+                }
+
+                ignoreChecksums[line.substr(42)] = line.substr(0, 40);
+            });
+    });
 }
 
 function cacheVFSChecksums() {
@@ -78,6 +115,13 @@ function cacheVFSChecksums() {
 
 // Cache the VFS checksums if available
 cacheVFSChecksums();
+
+// Cache the checksums of all files in the config.localDir
+cacheCurrentChecksums();
+
+// Update the .gitignore file
+updateGitIgnore();
+
 
 function playSound(sound) {
     sound = sound || config.sound.success;
@@ -151,11 +195,24 @@ function sha1sum(path, cb) {
     })
 }
 
-function updateGitIgnore(path, checksum) {
-    var gitignore = config.ignore.git;
+function updateGitIgnore() {
+    // TODO: Make it so this doesn't do a write if the file is unchanged
+
+    var ignore = [],
+        gitignore;
 
     for(var file in ignoreChecksums) {
-        // vfsChecksums[file] ==
+        if (vfsChecksums[file] === ignoreChecksums[file]) {
+            ignore.push(file);
+        }
+    }
+
+    gitignore = config.ignore.global.concat(config.ignore.git.concat(ignore));
+
+    try {
+        fs.writeFileSync(config.localDir + '/.gitignore', gitignore.join('\n'));
+    } catch (e) {
+        console.log(colors.yellow('[FAILED] ') + 'Failed to update .gitignore (' + e + ')');
     }
 }
 
@@ -184,7 +241,7 @@ function webDavRequest(verb, destination, file, callback) {
         auth:    config.webdav.username + ':' + config.webdav.password
     });
 
-    request.on("response", function (res) {
+    request.on('response', function (res) {
         // Ignore when a delete fails due to a 404
         if (res.statusCode >= 400 && !(verb === 'DELETE' && res.statusCode == 404) && // delete a file that doesn't exist
             !(verb === 'MKCOL' && res.statusCode == 405)  // make a directory that already exists
@@ -255,7 +312,8 @@ watcher.on('change', function (path, info) {
             }
             info.event = 'created';
         }
-    } else {
+    } else if (relPath !== '.gitignore') {
+
         sha1sum(path, function(err, checksum) {
             if (!err) {
                 DEBUG || console.log(path + ': ' + checksum);
@@ -336,10 +394,12 @@ watcher.start();
 
 // TODO: This is an anti-pattern, but ok for what we're using it for
 process.on('uncaughtException', function(err) {
+    console.error(err);
+
     require('child_process').exec("say -v Boing \"I'm sorry Dave, I'm afraid I can't do that\"");
 
     notifier.notify({
         'title': 'Emergence-watcher',
-        'message': 'The watcher has crashed with an uncaughr exception:\n' + err
+        'message': err
     });
 });
